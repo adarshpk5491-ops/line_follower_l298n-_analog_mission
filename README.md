@@ -72,35 +72,19 @@ An autonomous 3-sensor analog line-following robot powered by an Arduino Uno and
 flowchart TD
     Start(["Power On / Reset"]) --> Setup["setup()\n- Configure IR Pins as INPUT\n- Configure L298N Pins as OUTPUT\n- Initialize Serial at 9600 baud\n- Stop Motors\n- Delay 1000ms startup buffer"]
     
-    Setup --> LoopStart(["loop() Cycle Begins"])
+    Setup --> Phase1["STATE_TO_GOAL\nFollow line towards destination\n(Turn Left / Right / Move Forward)"]
     
-    LoopStart --> ReadSensors["readSensor() with ADC Settling\n- Left (A3)\n- Center (A4)\n- Right (A5)"]
+    Phase1 --> CheckGoal{"All 3 IR HIGH?\n(Destination Reached)"}
+    CheckGoal -- "No" --> Phase1
+    CheckGoal -- "Yes" --> Phase2["STATE_REVERSE_AT_GOAL\nmoveBackward(150)\nDrive backward for 3 seconds (3000ms)"]
     
-    ReadSensors --> Hysteresis["Hysteresis Filter (50-Point Deadband)\n- Reading >= 650: State = Black\n- Reading <= 600: State = White\n- 601 to 649: Hold Previous State"]
+    Phase2 --> Phase3["STATE_TURN_AROUND\nturnRightToFindLine()\nSpin right with both motors until line detected"]
     
-    Hysteresis --> DecisionStop{"left && center && right\n(All 3 Black?)"}
+    Phase3 --> Phase4["STATE_TO_START\nFollow line back towards starting point\n(Turn Left / Right / Move Forward)"]
     
-    DecisionStop -- "Yes" --> ActionStop["stopMotors()\n- Left Speed: 0\n- Right Speed: 0\n(T-Junction / Stop Line)"]
-    
-    DecisionStop -- "No" --> DecisionLeft{"left && !right\n(Left Black & Right White?)"}
-    
-    DecisionLeft -- "Yes" --> ActionLeft["turnLeft(150)\n- Left Motor: OFF\n- Right Motor: 150"]
-    
-    DecisionLeft -- "No" --> DecisionRight{"right && !left\n(Right Black & Left White?)"}
-    
-    DecisionRight -- "Yes" --> ActionRight["turnRight(150)\n- Left Motor: 150\n- Right Motor: OFF"]
-    
-    DecisionRight -- "No" --> ActionForward["moveForward(150)\n- Left Motor: 150\n- Right Motor: 150\n(Centered or Recovery)"]
-    
-    ActionStop --> Telemetry{"millis() - lastPrint >= 100ms?"}
-    ActionLeft --> Telemetry
-    ActionRight --> Telemetry
-    ActionForward --> Telemetry
-    
-    Telemetry -- "Yes" --> PrintOut["Serial.print(L, C, R values)\nUpdate lastPrint timestamp"]
-    Telemetry -- "No" --> LoopEnd(["Next Iteration"])
-    PrintOut --> LoopEnd
-    LoopEnd --> LoopStart
+    Phase4 --> CheckStart{"All 3 IR HIGH at Start?"}
+    CheckStart -- "No" --> Phase4
+    CheckStart -- "Yes" --> Phase5["STATE_COMPLETED\nstopMotors()\nMission Finished"]
 ```
 
 ---
@@ -138,17 +122,25 @@ flowchart LR
 
 ---
 
-### Decision Matrix & Steering Logic
+### Mission Phases & Steering Logic
 
-The control algorithm prioritizes stop markers and sharp deviations before applying default forward propulsion:
+The robot operates as a 5-phase mission state machine:
 
-| State | Left IR (`A3`) | Center IR (`A4`) | Right IR (`A5`) | Robot Action | Motor Speeds |
-| :---: | :---: | :---: | :---: | :--- | :--- |
-| **1** | **Black** | **Black** | **Black** | **Stop Motors** (Intersection / End Line) | Left: 0 \| Right: 0 |
-| **2** | **Black** | Any | White | **Turn Left** (Vehicle drifting right) | Left: 0 \| Right: 150 |
-| **3** | White | Any | **Black** | **Turn Right** (Vehicle drifting left) | Left: 150 \| Right: 0 |
-| **4** | White | **Black** | White | **Drive Forward** (Line centered) | Left: 150 \| Right: 150 |
-| **5** | White | White | White | **Drive Forward** (Coast / Bridge gaps) | Left: 150 \| Right: 150 |
+1. **`STATE_TO_GOAL`**: Follows the track towards the goal destination.
+2. **`STATE_REVERSE_AT_GOAL`**: Triggered when all 3 IR sensors detect Black (All HIGH). Brakes briefly and moves backward for 3 seconds (`3000ms`).
+3. **`STATE_TURN_AROUND`**: Executes an in-place right turn with both motors until the center IR sensor re-acquires the black track.
+4. **`STATE_TO_START`**: Follows the line back to the starting point.
+5. **`STATE_COMPLETED`**: Halts permanently when the starting point marker (All HIGH) is detected.
+
+| Mission Phase | IR Sensor Condition | Action | Left Speed (ENA) | Right Speed (ENB) |
+| :--- | :--- | :--- | :--- | :--- |
+| **`STATE_TO_GOAL`** | All 3 Black (`L && C && R`) | Destination reached -> Switch to Reverse | 0 | 0 |
+| **`STATE_TO_GOAL` / `STATE_TO_START`** | Left Black, Right White | Turn Left (both motors, 120-160) | Rev 150 | Fwd 150 |
+| **`STATE_TO_GOAL` / `STATE_TO_START`** | Right Black, Left White | Turn Right (both motors, 120-160) | Fwd 150 | Rev 150 |
+| **`STATE_TO_GOAL` / `STATE_TO_START`** | Center Black (or coasting) | Drive Forward (Full Speed) | Fwd 255 | Fwd 255 |
+| **`STATE_REVERSE_AT_GOAL`** | Destination reverse | Drive backward at controlled speed (120-160) for 500ms | Rev 150 | Rev 150 |
+| **`STATE_TURN_AROUND`** | Seeking line | Spin turn Right at controlled speed (120-160, 1000ms blind) | Fwd 150 | Rev 150 |
+| **`STATE_TO_START`** | All 3 Black (`L && C && R`) | Start reached -> Stop & finish mission | 0 | 0 |
 
 ---
 
@@ -158,9 +150,10 @@ The L298N direction inputs and PWM channels are driven as follows:
 
 | Function | ENA (D9) | IN1 (D8) | IN2 (D7) | ENB (D3) | IN3 (D5) | IN4 (D4) | Description |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
-| **`forward()`** | `150` | HIGH | LOW | `150` | HIGH | LOW | Both wheels forward |
-| **`turnLeft()`** | `0` | LOW | LOW | `150` | HIGH | LOW | Left stopped, Right forward |
-| **`turnRight()`** | `150` | HIGH | LOW | `0` | LOW | LOW | Left forward, Right stopped |
+| **`forward()`** | `255` | HIGH | LOW | `255` | HIGH | LOW | Both wheels forward (full speed cruising) |
+| **`backward()`** | `150` | LOW | HIGH | `150` | LOW | HIGH | Both wheels backward (controlled reverse) |
+| **`turnLeft()`** | `150` | LOW | HIGH | `150` | HIGH | LOW | Left reverse, Right forward (controlled point turn) |
+| **`turnRight()`** | `150` | HIGH | LOW | `150` | LOW | HIGH | Left forward, Right reverse (controlled point turn) |
 | **`stopMotors()`** | `0` | LOW | LOW | `0` | LOW | LOW | All coils disabled / coast to stop |
 
 ---
@@ -170,9 +163,12 @@ The L298N direction inputs and PWM channels are driven as follows:
 If the robot operates in a different ambient light environment or track surface, adjust these constants in `src/main.cpp`:
 
 ```cpp
-// Speed Settings (Range: 0 to 255)
-const int forwardSpeed = 150; // Straight-line cruising speed
-const int turnSpeed    = 150; // Turning maneuver speed
+// Speed & Timing Settings (Range: 0 to 255 / milliseconds)
+const int forwardSpeed = 255;                 // Straight-line cruising speed (full PWM: 255)
+const int turnSpeed    = 150;                 // Turn speed: between 120 - 160 (default 150)
+const int backwardSpeed = 150;                // Destination reverse speed: between 120 - 160 (default 150)
+const unsigned long backwardDuration = 500;   // Duration to reverse at destination (500 ms at ~150 speed)
+const unsigned long blindTurnDuration = 1000; // Duration to turn right without detecting line (1000 ms at ~150 speed)
 
 // Threshold Settings (Range: 0 to 1023)
 const int THRESHOLD_WHITE = 600;                   // Maximum reading for white surface
